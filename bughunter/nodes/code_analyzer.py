@@ -44,43 +44,46 @@ CANDIDATES:
 """
 
 
-def _try_cppcheck(code: str) -> str:
-    """Run cppcheck if available; return output or empty string."""
+def _run_lint(code: str) -> str:
+    """Run a C++ linter (clang-tidy or cpplint) to detect exact errors and line numbers."""
+    lint_output = ""
+    
     try:
         with tempfile.NamedTemporaryFile(
             suffix=".cpp", mode="w", delete=False
         ) as tmp:
             tmp.write(code)
             tmp.flush()
+            tmp_path = tmp.name
+        
+        # Try clang-tidy first (most comprehensive)
+        try:
             result = subprocess.run(
-                ["cppcheck", "--enable=all", "--quiet", tmp.name],
+                ["clang-tidy", tmp_path, "--checks=-*"],
                 capture_output=True,
                 text=True,
                 timeout=15,
             )
-            Path(tmp.name).unlink(missing_ok=True)
-            return (result.stdout + result.stderr).strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return ""
-
-
-def _regex_heuristics(code: str) -> str:
-    """Quick regex-based checks for common C++ / RDI issues."""
-    issues: list[str] = []
-    lines = code.splitlines()
-    for i, line in enumerate(lines, 1):
-        stripped = line.strip()
-        if "RDI_BEGIN" in stripped or "RDI_END" in stripped:
-            issues.append(f"Line {i}: RDI lifecycle call, verify ordering")
-        if re.search(r"\.vecEditMode\s*\(", stripped):
-            issues.append(f"Line {i}: vecEditMode call, verify mode parameter")
-        if re.search(r"\.iClamp\s*\(", stripped):
-            issues.append(f"Line {i}: iClamp call, verify (low, high) order")
-        if re.search(r"\.vForceRange\s*\(", stripped):
-            issues.append(f"Line {i}: vForceRange, verify value within allowed range")
-        if re.search(r"push_forward", stripped):
-            issues.append(f"Line {i}: push_forward is not a standard vector method, should be push_back")
-    return "\n".join(issues) if issues else "No heuristic issues found."
+            lint_output = (result.stdout + result.stderr).strip()
+        except FileNotFoundError:
+            # Fall back to cpplint (Google's linter)
+            try:
+                result = subprocess.run(
+                    ["cpplint", tmp_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                lint_output = (result.stdout + result.stderr).strip()
+            except FileNotFoundError:
+                pass
+        
+        Path(tmp_path).unlink(missing_ok=True)
+        
+    except (subprocess.TimeoutExpired, Exception):
+        pass
+    
+    return lint_output if lint_output else "No lint errors detected."
 
 
 def code_analyzer_node(state: BugHunterState) -> dict:
@@ -88,9 +91,7 @@ def code_analyzer_node(state: BugHunterState) -> dict:
     code = state["code"]
     context = state.get("context", "")
 
-    static_output = _try_cppcheck(code)
-    if not static_output:
-        static_output = _regex_heuristics(code)
+    static_output = _run_lint(code)
 
     llm = get_llm(temperature=0)
 
